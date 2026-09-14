@@ -33,7 +33,8 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
-#define BONGO_IDLE_TIMEOUT_MS 60000
+#define WPM_HISTORY_SAMPLE_PERIOD_MS 1000
+#define BONGO_IDLE_TIMEOUT_MS (NICEVIEW_WPM_HISTORY_SIZE * WPM_HISTORY_SAMPLE_PERIOD_MS)
 #define BONGO_IDLE_FRAME_PERIOD_MS 200
 #define BONGO_TAP_HOLD_MS 500
 #define BONGO_IDLE_TIMEOUT K_MSEC(BONGO_IDLE_TIMEOUT_MS)
@@ -227,22 +228,37 @@ static void draw_status(struct zmk_widget_status *widget) {
     }
 
     /* Match the stock nice!view widget's 90-degree rotation for the Corne mounting. */
+    bool changed = !widget->rendered;
     for (uint32_t y = 0; y < NICEVIEW_LOGICAL_HEIGHT; y++) {
         for (uint32_t x = 0; x < NICEVIEW_LOGICAL_WIDTH; x++) {
-            widget->display_cbuf[x * NICEVIEW_DISPLAY_WIDTH + (NICEVIEW_LOGICAL_HEIGHT - 1 - y)] =
-                widget->logical_cbuf[y * NICEVIEW_LOGICAL_WIDTH + x];
+            const uint32_t display_index =
+                x * NICEVIEW_DISPLAY_WIDTH + (NICEVIEW_LOGICAL_HEIGHT - 1 - y);
+            const lv_color_t pixel = widget->logical_cbuf[y * NICEVIEW_LOGICAL_WIDTH + x];
+            if (!changed &&
+                memcmp(&widget->display_cbuf[display_index], &pixel, sizeof(pixel)) != 0) {
+                changed = true;
+            }
+            widget->display_cbuf[display_index] = pixel;
         }
     }
-    lv_obj_invalidate(widget->display_canvas);
+
+    widget->rendered = true;
+    if (changed) {
+        lv_obj_invalidate(widget->display_canvas);
+    }
 }
 
 static void set_battery_status(struct zmk_widget_status *widget,
                                struct battery_status_state state) {
+    bool changed = widget->state.battery != state.level;
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
+    changed = changed || widget->state.charging != state.usb_present;
     widget->state.charging = state.usb_present;
 #endif
     widget->state.battery = state.level;
-    draw_status(widget);
+    if (changed) {
+        draw_status(widget);
+    }
 }
 
 static void battery_status_update_cb(struct battery_status_state state) {
@@ -270,15 +286,25 @@ ZMK_SUBSCRIPTION(widget_battery_status, zmk_usb_conn_state_changed);
 
 static void set_output_status(struct zmk_widget_status *widget,
                               const struct output_status_state *state) {
+    bool changed =
+        !zmk_endpoint_instance_eq(widget->state.selected_endpoint, state->selected_endpoint) ||
+        widget->state.active_profile_index != state->active_profile_index ||
+        widget->state.active_profile_connected != state->active_profile_connected ||
+        widget->state.active_profile_bonded != state->active_profile_bonded;
+
     widget->state.selected_endpoint = state->selected_endpoint;
     widget->state.active_profile_index = state->active_profile_index;
     widget->state.active_profile_connected = state->active_profile_connected;
     widget->state.active_profile_bonded = state->active_profile_bonded;
     for (int i = 0; i < NICEVIEW_PROFILE_COUNT; i++) {
+        changed = changed || widget->state.profiles_connected[i] != state->profiles_connected[i] ||
+                  widget->state.profiles_bonded[i] != state->profiles_bonded[i];
         widget->state.profiles_connected[i] = state->profiles_connected[i];
         widget->state.profiles_bonded[i] = state->profiles_bonded[i];
     }
-    draw_status(widget);
+    if (changed) {
+        draw_status(widget);
+    }
 }
 
 static void output_status_update_cb(struct output_status_state state) {
@@ -312,9 +338,16 @@ ZMK_SUBSCRIPTION(widget_output_status, zmk_ble_active_profile_changed);
 #endif
 
 static void set_layer_status(struct zmk_widget_status *widget, struct layer_status_state state) {
+    const bool label_changed = (widget->state.layer_label == NULL) != (state.label == NULL) ||
+                               (widget->state.layer_label != NULL && state.label != NULL &&
+                                strcmp(widget->state.layer_label, state.label) != 0);
+    const bool changed = widget->state.layer_index != state.index || label_changed;
+
     widget->state.layer_index = state.index;
     widget->state.layer_label = state.label;
-    draw_status(widget);
+    if (changed) {
+        draw_status(widget);
+    }
 }
 
 static void layer_status_update_cb(struct layer_status_state state) {
@@ -334,9 +367,19 @@ ZMK_DISPLAY_WIDGET_LISTENER(widget_layer_status, struct layer_status_state, laye
                             layer_status_get_state)
 ZMK_SUBSCRIPTION(widget_layer_status, zmk_layer_state_changed);
 
+static void restart_wpm_history_timer(void);
+
 static void set_wpm_status(struct zmk_widget_status *widget, struct wpm_status_state state) {
+    const uint8_t previous_wpm = widget->state.wpm[9];
+    const bool changed = previous_wpm != state.wpm;
+
     widget->state.wpm[9] = state.wpm;
-    draw_status(widget);
+    if (changed) {
+        draw_status(widget);
+    }
+    if (previous_wpm == 0 && state.wpm > 0 && widget->wpm_history_count == 0 && !widget->sleeping) {
+        restart_wpm_history_timer();
+    }
 }
 
 static void wpm_status_update_cb(struct wpm_status_state state) {
@@ -384,30 +427,72 @@ static void animation_work_cb(struct k_work *work) {
 
 K_WORK_DELAYABLE_DEFINE(status_animation_work, animation_work_cb);
 
+static bool wpm_history_has_bars(const struct zmk_widget_status *widget) {
+    for (uint8_t i = 0; i < widget->wpm_history_count; i++) {
+        if (widget->wpm_history[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool push_wpm_history(struct zmk_widget_status *widget, uint8_t wpm) {
+    if (widget->wpm_history_count == 0 && wpm == 0) {
+        return false;
+    }
+
+    bool changed = widget->wpm_history_count < NICEVIEW_WPM_HISTORY_SIZE;
+    if (!changed) {
+        for (uint8_t i = 0; i < NICEVIEW_WPM_HISTORY_SIZE; i++) {
+            if (widget->wpm_history[i] != wpm) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (!changed) {
+        return false;
+    }
+
+    widget->wpm_history[widget->wpm_history_head] = wpm;
+    widget->wpm_history_head = (widget->wpm_history_head + 1) % NICEVIEW_WPM_HISTORY_SIZE;
+    widget->wpm_history_count = MIN(widget->wpm_history_count + 1, NICEVIEW_WPM_HISTORY_SIZE);
+
+    if (!wpm_history_has_bars(widget)) {
+        widget->wpm_history_head = 0;
+        widget->wpm_history_count = 0;
+    }
+    return true;
+}
+
 static void wpm_history_work_cb(struct k_work *work) {
     bool keep_sampling = false;
     struct zmk_widget_status *widget;
 
-    ARG_UNUSED(work);
     SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
         if (widget->sleeping) {
             continue;
         }
 
-        widget->wpm_history[widget->wpm_history_head] = widget->state.wpm[9];
-        widget->wpm_history_head = (widget->wpm_history_head + 1) % NICEVIEW_WPM_HISTORY_SIZE;
-        widget->wpm_history_count = MIN(widget->wpm_history_count + 1, NICEVIEW_WPM_HISTORY_SIZE);
-        draw_status(widget);
-        keep_sampling = true;
+        if (push_wpm_history(widget, widget->state.wpm[9])) {
+            draw_status(widget);
+        }
+        keep_sampling = keep_sampling || widget->state.wpm[9] > 0 || widget->wpm_history_count > 0;
     }
 
     if (keep_sampling) {
-        k_work_reschedule_for_queue(
-            zmk_display_work_q(), CONTAINER_OF(work, struct k_work_delayable, work), K_SECONDS(1));
+        k_work_reschedule_for_queue(zmk_display_work_q(),
+                                    CONTAINER_OF(work, struct k_work_delayable, work),
+                                    K_MSEC(WPM_HISTORY_SAMPLE_PERIOD_MS));
     }
 }
 
 K_WORK_DELAYABLE_DEFINE(status_wpm_history_work, wpm_history_work_cb);
+
+static void restart_wpm_history_timer(void) {
+    k_work_reschedule_for_queue(zmk_display_work_q(), &status_wpm_history_work,
+                                K_MSEC(WPM_HISTORY_SAMPLE_PERIOD_MS));
+}
 
 static void idle_work_cb(struct k_work *work) {
     bool reschedule = false;
@@ -416,6 +501,10 @@ static void idle_work_cb(struct k_work *work) {
     struct zmk_widget_status *widget;
 
     SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
+        if (widget->sleeping) {
+            continue;
+        }
+
         const int64_t inactive_ms = now - widget->last_key_press_at;
         if (inactive_ms < BONGO_IDLE_TIMEOUT_MS) {
             next_delay_ms = MIN(next_delay_ms, BONGO_IDLE_TIMEOUT_MS - inactive_ms);
@@ -425,6 +514,9 @@ static void idle_work_cb(struct k_work *work) {
 
         widget->sleeping = true;
         widget->show_tap_frame = false;
+        memset(widget->wpm_history, 0, sizeof(widget->wpm_history));
+        widget->wpm_history_head = 0;
+        widget->wpm_history_count = 0;
         draw_status(widget);
     }
 
@@ -472,7 +564,7 @@ static void key_status_update_cb(struct key_status_state state) {
 
     k_work_reschedule_for_queue(zmk_display_work_q(), &status_animation_work, BONGO_TAP_HOLD);
     if (woke_from_sleep) {
-        k_work_reschedule_for_queue(zmk_display_work_q(), &status_wpm_history_work, K_SECONDS(1));
+        restart_wpm_history_timer();
     }
     restart_idle_timer();
 }
@@ -531,7 +623,7 @@ int zmk_widget_status_init(struct zmk_widget_status *widget, lv_obj_t *parent) {
     widget_key_status_init();
     k_work_reschedule_for_queue(zmk_display_work_q(), &status_animation_work,
                                 BONGO_IDLE_FRAME_PERIOD);
-    k_work_reschedule_for_queue(zmk_display_work_q(), &status_wpm_history_work, K_SECONDS(1));
+    restart_wpm_history_timer();
     restart_idle_timer();
 
     return 0;
