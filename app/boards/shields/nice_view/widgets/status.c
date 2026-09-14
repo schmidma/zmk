@@ -169,7 +169,7 @@ static void draw_sleep_overlay(lv_obj_t *canvas) {
     lv_canvas_draw_rect(canvas, 34, BONGO_FRAME_Y + 18, 2, 2, &foreground);
     lv_canvas_draw_rect(canvas, 20, BONGO_FRAME_Y + 14, 4, 1, &background);
     lv_canvas_draw_rect(canvas, 33, BONGO_FRAME_Y + 19, 4, 1, &background);
-    lv_canvas_draw_text(canvas, 34, BONGO_FRAME_Y - 11, 32, &label_dsc, "Zzzz");
+    lv_canvas_draw_text(canvas, 34, BONGO_FRAME_Y - 8, 32, &label_dsc, "Zzzz");
 }
 
 static void draw_status(struct zmk_widget_status *widget) {
