@@ -5,7 +5,13 @@
  *
  */
 
+#include <zephyr/kernel.h>
+
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 #include "widgets/status.h"
+#else
+#include "widgets/peripheral_status.h"
+#endif
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);

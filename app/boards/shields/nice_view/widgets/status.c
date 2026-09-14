@@ -5,26 +5,45 @@
  *
  */
 
-#include <zephyr/kernel.h>
+#include <stdio.h>
+#include <string.h>
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/battery.h>
+#include <zmk/ble.h>
 #include <zmk/display.h>
-#include "status.h"
-#include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/endpoints.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/ble_active_profile_changed.h>
 #include <zmk/events/endpoint_changed.h>
-#include <zmk/events/wpm_state_changed.h>
+#include <zmk/events/keycode_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
-#include <zmk/usb.h>
-#include <zmk/ble.h>
-#include <zmk/endpoints.h>
+#include <zmk/events/position_state_changed.h>
+#include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/events/wpm_state_changed.h>
 #include <zmk/keymap.h>
+#include <zmk/usb.h>
 #include <zmk/wpm.h>
+
+#include "bongo_frames.h"
+#include "status.h"
+
+LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+
+#define BONGO_IDLE_TIMEOUT_MS 60000
+#define BONGO_IDLE_FRAME_PERIOD_MS 200
+#define BONGO_TAP_HOLD_MS 500
+#define BONGO_IDLE_TIMEOUT K_MSEC(BONGO_IDLE_TIMEOUT_MS)
+#define BONGO_IDLE_FRAME_PERIOD K_MSEC(BONGO_IDLE_FRAME_PERIOD_MS)
+#define BONGO_TAP_HOLD K_MSEC(BONGO_TAP_HOLD_MS)
+#define BONGO_FRAME_Y (NICEVIEW_LOGICAL_HEIGHT - BONGO_FRAME_HEIGHT)
+#define WPM_GRAPH_X 2
+#define WPM_GRAPH_Y 60
+#define WPM_GRAPH_WIDTH 64
+#define WPM_GRAPH_HEIGHT 54
 
 static sys_slist_t widgets = SYS_SLIST_STATIC_INIT(&widgets);
 
@@ -46,173 +65,184 @@ struct wpm_status_state {
     uint8_t wpm;
 };
 
-static void draw_top(lv_obj_t *widget, lv_color_t cbuf[], const struct status_state *state) {
-    lv_obj_t *canvas = lv_obj_get_child(widget, 0);
+struct key_status_state {
+    uint32_t press_count;
+};
 
-    lv_draw_label_dsc_t label_dsc;
-    init_label_dsc(&label_dsc, LVGL_FOREGROUND, &lv_font_montserrat_16, LV_TEXT_ALIGN_RIGHT);
-    lv_draw_label_dsc_t label_dsc_wpm;
-    init_label_dsc(&label_dsc_wpm, LVGL_FOREGROUND, &lv_font_unscii_8, LV_TEXT_ALIGN_RIGHT);
-    lv_draw_rect_dsc_t rect_black_dsc;
-    init_rect_dsc(&rect_black_dsc, LVGL_BACKGROUND);
-    lv_draw_rect_dsc_t rect_white_dsc;
-    init_rect_dsc(&rect_white_dsc, LVGL_FOREGROUND);
-    lv_draw_line_dsc_t line_dsc;
-    init_line_dsc(&line_dsc, LVGL_FOREGROUND, 1);
-
-    // Fill background
-    lv_canvas_draw_rect(canvas, 0, 0, CANVAS_SIZE, CANVAS_SIZE, &rect_black_dsc);
-
-    // Draw battery
-    draw_battery(canvas, state);
-
-    // Draw output status
-    char output_text[10] = {};
-
-    switch (state->selected_endpoint.transport) {
-    case ZMK_TRANSPORT_USB:
-        strcat(output_text, LV_SYMBOL_USB);
-        break;
-    case ZMK_TRANSPORT_BLE:
-        if (state->active_profile_bonded) {
-            if (state->active_profile_connected) {
-                strcat(output_text, LV_SYMBOL_WIFI);
-            } else {
-                strcat(output_text, LV_SYMBOL_CLOSE);
-            }
-        } else {
-            strcat(output_text, LV_SYMBOL_SETTINGS);
-        }
-        break;
-    }
-
-    lv_canvas_draw_text(canvas, 0, 0, CANVAS_SIZE, &label_dsc, output_text);
-
-    // Draw WPM
-    lv_canvas_draw_rect(canvas, 0, 21, 68, 42, &rect_white_dsc);
-    lv_canvas_draw_rect(canvas, 1, 22, 66, 40, &rect_black_dsc);
-
-    char wpm_text[6] = {};
-    snprintf(wpm_text, sizeof(wpm_text), "%d", state->wpm[9]);
-    lv_canvas_draw_text(canvas, 42, 52, 24, &label_dsc_wpm, wpm_text);
-
-    int max = 0;
-    int min = 256;
-
-    for (int i = 0; i < 10; i++) {
-        if (state->wpm[i] > max) {
-            max = state->wpm[i];
-        }
-        if (state->wpm[i] < min) {
-            min = state->wpm[i];
-        }
-    }
-
-    int range = max - min;
-    if (range == 0) {
-        range = 1;
-    }
-
-    lv_point_t points[10];
-    for (int i = 0; i < 10; i++) {
-        points[i].x = 2 + i * 7;
-        points[i].y = 60 - (state->wpm[i] - min) * 36 / range;
-    }
-    lv_canvas_draw_line(canvas, points, 10, &line_dsc);
-
-    // Rotate canvas
-    rotate_canvas(canvas, cbuf);
-}
-
-static void draw_middle(lv_obj_t *widget, lv_color_t cbuf[], const struct status_state *state) {
-    lv_obj_t *canvas = lv_obj_get_child(widget, 1);
-
-    lv_draw_rect_dsc_t rect_black_dsc;
-    init_rect_dsc(&rect_black_dsc, LVGL_BACKGROUND);
-    lv_draw_rect_dsc_t rect_white_dsc;
-    init_rect_dsc(&rect_white_dsc, LVGL_FOREGROUND);
+static void draw_profile_status(lv_obj_t *canvas, const struct status_state *state) {
+    static const int profile_x[NICEVIEW_PROFILE_COUNT] = {7, 21, 34, 47, 61};
+    const int profile_y = 50;
     lv_draw_arc_dsc_t arc_dsc;
-    init_arc_dsc(&arc_dsc, LVGL_FOREGROUND, 2);
-    lv_draw_arc_dsc_t arc_dsc_filled;
-    init_arc_dsc(&arc_dsc_filled, LVGL_FOREGROUND, 9);
+    lv_draw_arc_dsc_t selected_dsc;
     lv_draw_label_dsc_t label_dsc;
-    init_label_dsc(&label_dsc, LVGL_FOREGROUND, &lv_font_montserrat_18, LV_TEXT_ALIGN_CENTER);
-    lv_draw_label_dsc_t label_dsc_black;
-    init_label_dsc(&label_dsc_black, LVGL_BACKGROUND, &lv_font_montserrat_18, LV_TEXT_ALIGN_CENTER);
+    lv_draw_label_dsc_t selected_label_dsc;
 
-    // Fill background
-    lv_canvas_draw_rect(canvas, 0, 0, CANVAS_SIZE, CANVAS_SIZE, &rect_black_dsc);
-
-    // Draw circles
-    int circle_offsets[NICEVIEW_PROFILE_COUNT][2] = {
-        {13, 13}, {55, 13}, {34, 34}, {13, 55}, {55, 55},
-    };
+    init_arc_dsc(&arc_dsc, LVGL_FOREGROUND, 1);
+    init_arc_dsc(&selected_dsc, LVGL_FOREGROUND, 7);
+    init_label_dsc(&label_dsc, LVGL_FOREGROUND, &lv_font_unscii_8, LV_TEXT_ALIGN_CENTER);
+    init_label_dsc(&selected_label_dsc, LVGL_BACKGROUND, &lv_font_unscii_8, LV_TEXT_ALIGN_CENTER);
 
     for (int i = 0; i < NICEVIEW_PROFILE_COUNT; i++) {
-        bool selected = i == state->active_profile_index;
+        const bool selected = i == state->active_profile_index;
 
         if (state->profiles_connected[i]) {
-            lv_canvas_draw_arc(canvas, circle_offsets[i][0], circle_offsets[i][1], 13, 0, 360,
-                               &arc_dsc);
+            lv_canvas_draw_arc(canvas, profile_x[i], profile_y, 5, 0, 360, &arc_dsc);
         } else if (state->profiles_bonded[i]) {
-            const int segments = 8;
-            const int gap = 20;
-            for (int j = 0; j < segments; ++j)
-                lv_canvas_draw_arc(canvas, circle_offsets[i][0], circle_offsets[i][1], 13,
-                                   360. / segments * j + gap / 2.0,
-                                   360. / segments * (j + 1) - gap / 2.0, &arc_dsc);
+            const int segments = 6;
+            const int gap = 24;
+            for (int segment = 0; segment < segments; segment++) {
+                lv_canvas_draw_arc(canvas, profile_x[i], profile_y, 5,
+                                   360. / segments * segment + gap / 2.0,
+                                   360. / segments * (segment + 1) - gap / 2.0, &arc_dsc);
+            }
         }
 
         if (selected) {
-            lv_canvas_draw_arc(canvas, circle_offsets[i][0], circle_offsets[i][1], 9, 0, 359,
-                               &arc_dsc_filled);
+            lv_canvas_draw_arc(canvas, profile_x[i], profile_y, 3, 0, 359, &selected_dsc);
         }
 
         char label[2];
         snprintf(label, sizeof(label), "%d", i + 1);
-        lv_canvas_draw_text(canvas, circle_offsets[i][0] - 8, circle_offsets[i][1] - 10, 16,
-                            (selected ? &label_dsc_black : &label_dsc), label);
+        lv_canvas_draw_text(canvas, profile_x[i] - 4, profile_y - 5, 8,
+                            selected ? &selected_label_dsc : &label_dsc, label);
     }
-
-    // Rotate canvas
-    rotate_canvas(canvas, cbuf);
 }
 
-static void draw_bottom(lv_obj_t *widget, lv_color_t cbuf[], const struct status_state *state) {
-    lv_obj_t *canvas = lv_obj_get_child(widget, 2);
+static void draw_wpm_graph(lv_obj_t *canvas, const struct zmk_widget_status *widget) {
+    lv_draw_rect_dsc_t rect_dsc;
+    uint8_t scale = 60;
 
-    lv_draw_rect_dsc_t rect_black_dsc;
-    init_rect_dsc(&rect_black_dsc, LVGL_BACKGROUND);
-    lv_draw_label_dsc_t label_dsc;
-    init_label_dsc(&label_dsc, LVGL_FOREGROUND, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
+    init_rect_dsc(&rect_dsc, LVGL_FOREGROUND);
 
-    // Fill background
-    lv_canvas_draw_rect(canvas, 0, 0, CANVAS_SIZE, CANVAS_SIZE, &rect_black_dsc);
-
-    // Draw layer
-    if (state->layer_label == NULL || strlen(state->layer_label) == 0) {
-        char text[10] = {};
-
-        sprintf(text, "LAYER %i", state->layer_index);
-
-        lv_canvas_draw_text(canvas, 0, 5, 68, &label_dsc, text);
-    } else {
-        lv_canvas_draw_text(canvas, 0, 5, 68, &label_dsc, state->layer_label);
+    for (uint8_t i = 0; i < widget->wpm_history_count; i++) {
+        const uint8_t index =
+            (widget->wpm_history_head + NICEVIEW_WPM_HISTORY_SIZE - widget->wpm_history_count + i) %
+            NICEVIEW_WPM_HISTORY_SIZE;
+        scale = MAX(scale, widget->wpm_history[index]);
     }
 
-    // Rotate canvas
-    rotate_canvas(canvas, cbuf);
+    lv_canvas_draw_rect(canvas, WPM_GRAPH_X, WPM_GRAPH_Y, 1, WPM_GRAPH_HEIGHT, &rect_dsc);
+    lv_canvas_draw_rect(canvas, WPM_GRAPH_X, WPM_GRAPH_Y + WPM_GRAPH_HEIGHT - 1, WPM_GRAPH_WIDTH, 1,
+                        &rect_dsc);
+
+    for (uint8_t i = 0; i < widget->wpm_history_count; i++) {
+        const uint8_t index =
+            (widget->wpm_history_head + NICEVIEW_WPM_HISTORY_SIZE - widget->wpm_history_count + i) %
+            NICEVIEW_WPM_HISTORY_SIZE;
+        const uint8_t value = widget->wpm_history[index];
+        if (value == 0) {
+            continue;
+        }
+
+        const uint8_t bar_height =
+            MIN(WPM_GRAPH_HEIGHT - 2, (value * (WPM_GRAPH_HEIGHT - 2) + scale - 1) / scale);
+        const int x =
+            WPM_GRAPH_X + 1 + (NICEVIEW_WPM_HISTORY_SIZE - widget->wpm_history_count + i) * 4;
+        const int y = WPM_GRAPH_Y + WPM_GRAPH_HEIGHT - 1 - bar_height;
+        lv_canvas_draw_rect(canvas, x, y, 3, bar_height, &rect_dsc);
+    }
+}
+
+static void draw_bongo_bitmap(lv_obj_t *canvas, const uint8_t *bitmap) {
+    for (uint32_t y = 0; y < BONGO_FRAME_HEIGHT; y++) {
+        for (uint32_t x = 0; x < BONGO_FRAME_WIDTH; x++) {
+            const uint8_t packed = bitmap[y * BONGO_FRAME_STRIDE_BYTES + x / 8];
+            if ((packed & BIT(7 - (x % 8))) != 0) {
+                lv_canvas_set_px(canvas, x, BONGO_FRAME_Y + y, LVGL_FOREGROUND);
+            }
+        }
+    }
+}
+
+static void draw_sleep_overlay(lv_obj_t *canvas) {
+    lv_draw_rect_dsc_t foreground;
+    lv_draw_rect_dsc_t background;
+    lv_draw_label_dsc_t label_dsc;
+
+    init_rect_dsc(&foreground, LVGL_FOREGROUND);
+    init_rect_dsc(&background, LVGL_BACKGROUND);
+    init_label_dsc(&label_dsc, LVGL_FOREGROUND, &lv_font_unscii_8, LV_TEXT_ALIGN_RIGHT);
+
+    /* Preserve idle frame 0 and replace only its open eyes with closed-eye lines. */
+    lv_canvas_draw_rect(canvas, 21, BONGO_FRAME_Y + 13, 2, 3, &foreground);
+    lv_canvas_draw_rect(canvas, 34, BONGO_FRAME_Y + 18, 2, 2, &foreground);
+    lv_canvas_draw_rect(canvas, 20, BONGO_FRAME_Y + 14, 4, 1, &background);
+    lv_canvas_draw_rect(canvas, 33, BONGO_FRAME_Y + 19, 4, 1, &background);
+    lv_canvas_draw_text(canvas, 34, BONGO_FRAME_Y - 11, 32, &label_dsc, "Zzzz");
+}
+
+static void draw_status(struct zmk_widget_status *widget) {
+    lv_obj_t *canvas = widget->logical_canvas;
+    lv_draw_label_dsc_t layer_dsc;
+    lv_draw_label_dsc_t status_dsc;
+    lv_draw_label_dsc_t wpm_dsc;
+    const uint8_t *frame;
+    char wpm_text[8];
+    char layer_text[12];
+    const char *output_text = "";
+
+    lv_canvas_fill_bg(canvas, LVGL_BACKGROUND, LV_OPA_COVER);
+
+    draw_battery(canvas, &widget->state);
+
+    init_label_dsc(&status_dsc, LVGL_FOREGROUND, &lv_font_montserrat_16, LV_TEXT_ALIGN_RIGHT);
+    switch (widget->state.selected_endpoint.transport) {
+    case ZMK_TRANSPORT_USB:
+        output_text = LV_SYMBOL_USB;
+        break;
+    case ZMK_TRANSPORT_BLE:
+        if (widget->state.active_profile_bonded) {
+            output_text = widget->state.active_profile_connected ? LV_SYMBOL_WIFI : LV_SYMBOL_CLOSE;
+        } else {
+            output_text = LV_SYMBOL_SETTINGS;
+        }
+        break;
+    }
+    lv_canvas_draw_text(canvas, 36, 0, 31, &status_dsc, output_text);
+
+    init_label_dsc(&layer_dsc, LVGL_FOREGROUND, &lv_font_montserrat_14, LV_TEXT_ALIGN_CENTER);
+    if (widget->state.layer_label != NULL && strlen(widget->state.layer_label) > 0) {
+        snprintf(layer_text, sizeof(layer_text), "%.11s", widget->state.layer_label);
+    } else {
+        snprintf(layer_text, sizeof(layer_text), "LAYER %u", widget->state.layer_index);
+    }
+    lv_canvas_draw_text(canvas, 0, 16, NICEVIEW_LOGICAL_WIDTH, &layer_dsc, layer_text);
+
+    init_label_dsc(&wpm_dsc, LVGL_FOREGROUND, &lv_font_unscii_8, LV_TEXT_ALIGN_LEFT);
+    snprintf(wpm_text, sizeof(wpm_text), "%u WPM", widget->state.wpm[9]);
+    lv_canvas_draw_text(canvas, 2, 34, 64, &wpm_dsc, wpm_text);
+    draw_profile_status(canvas, &widget->state);
+    draw_wpm_graph(canvas, widget);
+
+    if (widget->sleeping) {
+        frame = bongo_idle_frames[0];
+    } else if (widget->show_tap_frame) {
+        frame = bongo_tap_frames[widget->alternate_paw ? 1 : 0];
+    } else {
+        frame = bongo_idle_frames[widget->idle_frame % BONGO_IDLE_FRAME_COUNT];
+    }
+    draw_bongo_bitmap(canvas, frame);
+    if (widget->sleeping) {
+        draw_sleep_overlay(canvas);
+    }
+
+    /* Match the stock nice!view widget's 90-degree rotation for the Corne mounting. */
+    for (uint32_t y = 0; y < NICEVIEW_LOGICAL_HEIGHT; y++) {
+        for (uint32_t x = 0; x < NICEVIEW_LOGICAL_WIDTH; x++) {
+            widget->display_cbuf[x * NICEVIEW_DISPLAY_WIDTH + (NICEVIEW_LOGICAL_HEIGHT - 1 - y)] =
+                widget->logical_cbuf[y * NICEVIEW_LOGICAL_WIDTH + x];
+        }
+    }
+    lv_obj_invalidate(widget->display_canvas);
 }
 
 static void set_battery_status(struct zmk_widget_status *widget,
                                struct battery_status_state state) {
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
     widget->state.charging = state.usb_present;
-#endif /* IS_ENABLED(CONFIG_USB_DEVICE_STACK) */
-
+#endif
     widget->state.battery = state.level;
-
-    draw_top(widget->obj, widget->cbuf, &widget->state);
+    draw_status(widget);
 }
 
 static void battery_status_update_cb(struct battery_status_state state) {
@@ -221,23 +251,22 @@ static void battery_status_update_cb(struct battery_status_state state) {
 }
 
 static struct battery_status_state battery_status_get_state(const zmk_event_t *eh) {
-    const struct zmk_battery_state_changed *ev = as_zmk_battery_state_changed(eh);
+    const struct zmk_battery_state_changed *event = as_zmk_battery_state_changed(eh);
 
     return (struct battery_status_state){
-        .level = (ev != NULL) ? ev->state_of_charge : zmk_battery_state_of_charge(),
+        .level = event != NULL ? event->state_of_charge : zmk_battery_state_of_charge(),
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
         .usb_present = zmk_usb_is_powered(),
-#endif /* IS_ENABLED(CONFIG_USB_DEVICE_STACK) */
+#endif
     };
 }
 
 ZMK_DISPLAY_WIDGET_LISTENER(widget_battery_status, struct battery_status_state,
                             battery_status_update_cb, battery_status_get_state)
-
 ZMK_SUBSCRIPTION(widget_battery_status, zmk_battery_state_changed);
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
 ZMK_SUBSCRIPTION(widget_battery_status, zmk_usb_conn_state_changed);
-#endif /* IS_ENABLED(CONFIG_USB_DEVICE_STACK) */
+#endif
 
 static void set_output_status(struct zmk_widget_status *widget,
                               const struct output_status_state *state) {
@@ -245,13 +274,11 @@ static void set_output_status(struct zmk_widget_status *widget,
     widget->state.active_profile_index = state->active_profile_index;
     widget->state.active_profile_connected = state->active_profile_connected;
     widget->state.active_profile_bonded = state->active_profile_bonded;
-    for (int i = 0; i < NICEVIEW_PROFILE_COUNT; ++i) {
+    for (int i = 0; i < NICEVIEW_PROFILE_COUNT; i++) {
         widget->state.profiles_connected[i] = state->profiles_connected[i];
         widget->state.profiles_bonded[i] = state->profiles_bonded[i];
     }
-
-    draw_top(widget->obj, widget->cbuf, &widget->state);
-    draw_middle(widget->obj, widget->cbuf2, &widget->state);
+    draw_status(widget);
 }
 
 static void output_status_update_cb(struct output_status_state state) {
@@ -259,14 +286,15 @@ static void output_status_update_cb(struct output_status_state state) {
     SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) { set_output_status(widget, &state); }
 }
 
-static struct output_status_state output_status_get_state(const zmk_event_t *_eh) {
+static struct output_status_state output_status_get_state(const zmk_event_t *eh) {
     struct output_status_state state = {
         .selected_endpoint = zmk_endpoints_selected(),
         .active_profile_index = zmk_ble_active_profile_index(),
         .active_profile_connected = zmk_ble_active_profile_is_connected(),
         .active_profile_bonded = !zmk_ble_active_profile_is_open(),
     };
-    for (int i = 0; i < MIN(NICEVIEW_PROFILE_COUNT, ZMK_BLE_PROFILE_COUNT); ++i) {
+
+    for (int i = 0; i < MIN(NICEVIEW_PROFILE_COUNT, ZMK_BLE_PROFILE_COUNT); i++) {
         state.profiles_connected[i] = zmk_ble_profile_is_connected(i);
         state.profiles_bonded[i] = !zmk_ble_profile_is_open(i);
     }
@@ -276,7 +304,6 @@ static struct output_status_state output_status_get_state(const zmk_event_t *_eh
 ZMK_DISPLAY_WIDGET_LISTENER(widget_output_status, struct output_status_state,
                             output_status_update_cb, output_status_get_state)
 ZMK_SUBSCRIPTION(widget_output_status, zmk_endpoint_changed);
-
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
 ZMK_SUBSCRIPTION(widget_output_status, zmk_usb_conn_state_changed);
 #endif
@@ -287,8 +314,7 @@ ZMK_SUBSCRIPTION(widget_output_status, zmk_ble_active_profile_changed);
 static void set_layer_status(struct zmk_widget_status *widget, struct layer_status_state state) {
     widget->state.layer_index = state.index;
     widget->state.layer_label = state.label;
-
-    draw_bottom(widget->obj, widget->cbuf3, &widget->state);
+    draw_status(widget);
 }
 
 static void layer_status_update_cb(struct layer_status_state state) {
@@ -297,23 +323,20 @@ static void layer_status_update_cb(struct layer_status_state state) {
 }
 
 static struct layer_status_state layer_status_get_state(const zmk_event_t *eh) {
-    zmk_keymap_layer_index_t index = zmk_keymap_highest_layer_active();
+    const zmk_keymap_layer_index_t index = zmk_keymap_highest_layer_active();
     return (struct layer_status_state){
-        .index = index, .label = zmk_keymap_layer_name(zmk_keymap_layer_index_to_id(index))};
+        .index = index,
+        .label = zmk_keymap_layer_name(zmk_keymap_layer_index_to_id(index)),
+    };
 }
 
 ZMK_DISPLAY_WIDGET_LISTENER(widget_layer_status, struct layer_status_state, layer_status_update_cb,
                             layer_status_get_state)
-
 ZMK_SUBSCRIPTION(widget_layer_status, zmk_layer_state_changed);
 
 static void set_wpm_status(struct zmk_widget_status *widget, struct wpm_status_state state) {
-    for (int i = 0; i < 9; i++) {
-        widget->state.wpm[i] = widget->state.wpm[i + 1];
-    }
     widget->state.wpm[9] = state.wpm;
-
-    draw_top(widget->obj, widget->cbuf, &widget->state);
+    draw_status(widget);
 }
 
 static void wpm_status_update_cb(struct wpm_status_state state) {
@@ -321,32 +344,195 @@ static void wpm_status_update_cb(struct wpm_status_state state) {
     SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) { set_wpm_status(widget, state); }
 }
 
-struct wpm_status_state wpm_status_get_state(const zmk_event_t *eh) {
+static struct wpm_status_state wpm_status_get_state(const zmk_event_t *eh) {
     return (struct wpm_status_state){.wpm = zmk_wpm_get_state()};
-};
+}
 
 ZMK_DISPLAY_WIDGET_LISTENER(widget_wpm_status, struct wpm_status_state, wpm_status_update_cb,
                             wpm_status_get_state)
 ZMK_SUBSCRIPTION(widget_wpm_status, zmk_wpm_state_changed);
 
+static void animation_work_cb(struct k_work *work) {
+    bool keep_animating = false;
+    int64_t next_delay_ms = BONGO_IDLE_FRAME_PERIOD_MS;
+    const int64_t now = k_uptime_get();
+    struct zmk_widget_status *widget;
+
+    SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
+        if (widget->sleeping) {
+            continue;
+        }
+
+        if (widget->show_tap_frame && now < widget->tap_until) {
+            next_delay_ms = MIN(next_delay_ms, widget->tap_until - now);
+            keep_animating = true;
+            continue;
+        }
+
+        widget->show_tap_frame = false;
+        widget->idle_frame = (widget->idle_frame + 1) % BONGO_IDLE_FRAME_COUNT;
+        draw_status(widget);
+        keep_animating = true;
+    }
+
+    if (keep_animating) {
+        k_work_reschedule_for_queue(zmk_display_work_q(),
+                                    CONTAINER_OF(work, struct k_work_delayable, work),
+                                    K_MSEC(MAX(1, next_delay_ms)));
+    }
+}
+
+K_WORK_DELAYABLE_DEFINE(status_animation_work, animation_work_cb);
+
+static void wpm_history_work_cb(struct k_work *work) {
+    bool keep_sampling = false;
+    struct zmk_widget_status *widget;
+
+    ARG_UNUSED(work);
+    SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
+        if (widget->sleeping) {
+            continue;
+        }
+
+        widget->wpm_history[widget->wpm_history_head] = widget->state.wpm[9];
+        widget->wpm_history_head = (widget->wpm_history_head + 1) % NICEVIEW_WPM_HISTORY_SIZE;
+        widget->wpm_history_count = MIN(widget->wpm_history_count + 1, NICEVIEW_WPM_HISTORY_SIZE);
+        draw_status(widget);
+        keep_sampling = true;
+    }
+
+    if (keep_sampling) {
+        k_work_reschedule_for_queue(
+            zmk_display_work_q(), CONTAINER_OF(work, struct k_work_delayable, work), K_SECONDS(1));
+    }
+}
+
+K_WORK_DELAYABLE_DEFINE(status_wpm_history_work, wpm_history_work_cb);
+
+static void idle_work_cb(struct k_work *work) {
+    bool reschedule = false;
+    int64_t next_delay_ms = BONGO_IDLE_TIMEOUT_MS;
+    const int64_t now = k_uptime_get();
+    struct zmk_widget_status *widget;
+
+    SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
+        const int64_t inactive_ms = now - widget->last_key_press_at;
+        if (inactive_ms < BONGO_IDLE_TIMEOUT_MS) {
+            next_delay_ms = MIN(next_delay_ms, BONGO_IDLE_TIMEOUT_MS - inactive_ms);
+            reschedule = true;
+            continue;
+        }
+
+        widget->sleeping = true;
+        widget->show_tap_frame = false;
+        draw_status(widget);
+    }
+
+    if (reschedule) {
+        k_work_reschedule_for_queue(zmk_display_work_q(),
+                                    CONTAINER_OF(work, struct k_work_delayable, work),
+                                    K_MSEC(MAX(1, next_delay_ms)));
+    }
+}
+
+K_WORK_DELAYABLE_DEFINE(status_idle_work, idle_work_cb);
+
+static void restart_idle_timer(void) {
+    k_work_reschedule_for_queue(zmk_display_work_q(), &status_idle_work, BONGO_IDLE_TIMEOUT);
+}
+
+static void key_status_update_cb(struct key_status_state state) {
+    bool handled_press = false;
+    bool woke_from_sleep = false;
+    const int64_t now = k_uptime_get();
+    struct zmk_widget_status *widget;
+
+    SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
+        if (widget->key_press_count == state.press_count) {
+            continue;
+        }
+
+        const uint32_t press_delta = state.press_count - widget->key_press_count;
+        widget->key_press_count = state.press_count;
+        widget->last_key_press_at = now;
+        widget->tap_until = now + BONGO_TAP_HOLD_MS;
+        handled_press = true;
+        woke_from_sleep = woke_from_sleep || widget->sleeping;
+        widget->sleeping = false;
+        widget->show_tap_frame = true;
+        if ((press_delta & 1U) != 0U) {
+            widget->alternate_paw = !widget->alternate_paw;
+        }
+        draw_status(widget);
+    }
+
+    if (!handled_press) {
+        return;
+    }
+
+    k_work_reschedule_for_queue(zmk_display_work_q(), &status_animation_work, BONGO_TAP_HOLD);
+    if (woke_from_sleep) {
+        k_work_reschedule_for_queue(zmk_display_work_q(), &status_wpm_history_work, K_SECONDS(1));
+    }
+    restart_idle_timer();
+}
+
+static struct key_status_state key_status_get_state(const zmk_event_t *eh) {
+    static uint32_t press_count;
+    static int64_t last_physical_timestamp = -1;
+    static int64_t last_keycode_timestamp = -1;
+
+    if (eh == NULL) {
+        return (struct key_status_state){.press_count = press_count};
+    }
+
+    const struct zmk_position_state_changed *position = as_zmk_position_state_changed(eh);
+    const struct zmk_keycode_state_changed *keycode = as_zmk_keycode_state_changed(eh);
+
+    /* A physical key normally also raises a keycode event with the same timestamp. Count it once,
+     * while still accepting keycode-only input sources. */
+    if (position != NULL && position->state && position->timestamp != last_keycode_timestamp) {
+        press_count++;
+        last_physical_timestamp = position->timestamp;
+    } else if (keycode != NULL && keycode->state && keycode->timestamp != last_physical_timestamp) {
+        press_count++;
+        last_keycode_timestamp = keycode->timestamp;
+    }
+
+    return (struct key_status_state){.press_count = press_count};
+}
+
+ZMK_DISPLAY_WIDGET_LISTENER(widget_key_status, struct key_status_state, key_status_update_cb,
+                            key_status_get_state)
+ZMK_SUBSCRIPTION(widget_key_status, zmk_position_state_changed);
+ZMK_SUBSCRIPTION(widget_key_status, zmk_keycode_state_changed);
+
 int zmk_widget_status_init(struct zmk_widget_status *widget, lv_obj_t *parent) {
     widget->obj = lv_obj_create(parent);
-    lv_obj_set_size(widget->obj, 160, 68);
-    lv_obj_t *top = lv_canvas_create(widget->obj);
-    lv_obj_align(top, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_canvas_set_buffer(top, widget->cbuf, CANVAS_SIZE, CANVAS_SIZE, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_t *middle = lv_canvas_create(widget->obj);
-    lv_obj_align(middle, LV_ALIGN_TOP_LEFT, 24, 0);
-    lv_canvas_set_buffer(middle, widget->cbuf2, CANVAS_SIZE, CANVAS_SIZE, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_t *bottom = lv_canvas_create(widget->obj);
-    lv_obj_align(bottom, LV_ALIGN_TOP_LEFT, -44, 0);
-    lv_canvas_set_buffer(bottom, widget->cbuf3, CANVAS_SIZE, CANVAS_SIZE, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_set_size(widget->obj, NICEVIEW_DISPLAY_WIDTH, NICEVIEW_DISPLAY_HEIGHT);
 
+    widget->logical_canvas = lv_canvas_create(widget->obj);
+    lv_canvas_set_buffer(widget->logical_canvas, widget->logical_cbuf, NICEVIEW_LOGICAL_WIDTH,
+                         NICEVIEW_LOGICAL_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_add_flag(widget->logical_canvas, LV_OBJ_FLAG_HIDDEN);
+
+    widget->display_canvas = lv_canvas_create(widget->obj);
+    lv_obj_align(widget->display_canvas, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_canvas_set_buffer(widget->display_canvas, widget->display_cbuf, NICEVIEW_DISPLAY_WIDTH,
+                         NICEVIEW_DISPLAY_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+
+    widget->last_key_press_at = k_uptime_get();
     sys_slist_append(&widgets, &widget->node);
+    draw_status(widget);
     widget_battery_status_init();
     widget_output_status_init();
     widget_layer_status_init();
     widget_wpm_status_init();
+    widget_key_status_init();
+    k_work_reschedule_for_queue(zmk_display_work_q(), &status_animation_work,
+                                BONGO_IDLE_FRAME_PERIOD);
+    k_work_reschedule_for_queue(zmk_display_work_q(), &status_wpm_history_work, K_SECONDS(1));
+    restart_idle_timer();
 
     return 0;
 }
