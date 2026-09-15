@@ -33,11 +33,13 @@ struct zmk_widget_status {
     uint8_t wpm_history_head;
     uint8_t wpm_history_count;
     uint8_t idle_frame;
+    uint8_t sleep_frame;
     uint32_t key_press_count;
     int64_t last_key_press_at;
     int64_t tap_until;
     bool alternate_paw;
     bool show_tap_frame;
+    bool falling_asleep;
     bool sleeping;
     bool rendered;
 };

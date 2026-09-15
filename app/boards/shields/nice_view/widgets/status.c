@@ -37,9 +37,14 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define BONGO_IDLE_TIMEOUT_MS (NICEVIEW_WPM_HISTORY_SIZE * WPM_HISTORY_SAMPLE_PERIOD_MS)
 #define BONGO_IDLE_FRAME_PERIOD_MS 200
 #define BONGO_TAP_HOLD_MS 500
-#define BONGO_IDLE_TIMEOUT K_MSEC(BONGO_IDLE_TIMEOUT_MS)
+#define BONGO_SLEEP_FRAME_PERIOD_MS 400
+#define BONGO_SLEEP_TRANSITION_MS ((BONGO_SLEEP_FRAME_COUNT - 1) * BONGO_SLEEP_FRAME_PERIOD_MS)
+#define BONGO_SLEEP_TRANSITION_START_MS (BONGO_IDLE_TIMEOUT_MS - BONGO_SLEEP_TRANSITION_MS)
 #define BONGO_IDLE_FRAME_PERIOD K_MSEC(BONGO_IDLE_FRAME_PERIOD_MS)
 #define BONGO_TAP_HOLD K_MSEC(BONGO_TAP_HOLD_MS)
+#define BONGO_SLEEP_TRANSITION_START K_MSEC(BONGO_SLEEP_TRANSITION_START_MS)
+
+BUILD_ASSERT(BONGO_SLEEP_TRANSITION_MS < BONGO_IDLE_TIMEOUT_MS);
 #define BONGO_FRAME_Y (NICEVIEW_LOGICAL_HEIGHT - BONGO_FRAME_HEIGHT)
 #define WPM_GRAPH_X 2
 #define WPM_GRAPH_Y 60
@@ -155,23 +160,6 @@ static void draw_bongo_bitmap(lv_obj_t *canvas, const uint8_t *bitmap) {
     }
 }
 
-static void draw_sleep_overlay(lv_obj_t *canvas) {
-    lv_draw_rect_dsc_t foreground;
-    lv_draw_rect_dsc_t background;
-    lv_draw_label_dsc_t label_dsc;
-
-    init_rect_dsc(&foreground, LVGL_FOREGROUND);
-    init_rect_dsc(&background, LVGL_BACKGROUND);
-    init_label_dsc(&label_dsc, LVGL_FOREGROUND, &lv_font_unscii_8, LV_TEXT_ALIGN_RIGHT);
-
-    /* Preserve idle frame 0 and replace only its open eyes with closed-eye lines. */
-    lv_canvas_draw_rect(canvas, 21, BONGO_FRAME_Y + 13, 2, 3, &foreground);
-    lv_canvas_draw_rect(canvas, 34, BONGO_FRAME_Y + 18, 2, 2, &foreground);
-    lv_canvas_draw_rect(canvas, 20, BONGO_FRAME_Y + 14, 4, 1, &background);
-    lv_canvas_draw_rect(canvas, 33, BONGO_FRAME_Y + 19, 4, 1, &background);
-    lv_canvas_draw_text(canvas, 34, BONGO_FRAME_Y - 8, 32, &label_dsc, "Zzzz");
-}
-
 static void draw_status(struct zmk_widget_status *widget) {
     lv_obj_t *canvas = widget->logical_canvas;
     lv_draw_label_dsc_t layer_dsc;
@@ -215,17 +203,14 @@ static void draw_status(struct zmk_widget_status *widget) {
     draw_profile_status(canvas, &widget->state);
     draw_wpm_graph(canvas, widget);
 
-    if (widget->sleeping) {
-        frame = bongo_idle_frames[0];
+    if (widget->sleeping || widget->falling_asleep) {
+        frame = bongo_sleep_frames[widget->sleep_frame % BONGO_SLEEP_FRAME_COUNT];
     } else if (widget->show_tap_frame) {
         frame = bongo_tap_frames[widget->alternate_paw ? 1 : 0];
     } else {
         frame = bongo_idle_frames[widget->idle_frame % BONGO_IDLE_FRAME_COUNT];
     }
     draw_bongo_bitmap(canvas, frame);
-    if (widget->sleeping) {
-        draw_sleep_overlay(canvas);
-    }
 
     /* Match the stock nice!view widget's 90-degree rotation for the Corne mounting. */
     bool changed = !widget->rendered;
@@ -402,7 +387,7 @@ static void animation_work_cb(struct k_work *work) {
     struct zmk_widget_status *widget;
 
     SYS_SLIST_FOR_EACH_CONTAINER(&widgets, widget, node) {
-        if (widget->sleeping) {
+        if (widget->sleeping || widget->falling_asleep) {
             continue;
         }
 
@@ -496,7 +481,7 @@ static void restart_wpm_history_timer(void) {
 
 static void idle_work_cb(struct k_work *work) {
     bool reschedule = false;
-    int64_t next_delay_ms = BONGO_IDLE_TIMEOUT_MS;
+    int64_t next_run_at = INT64_MAX;
     const int64_t now = k_uptime_get();
     struct zmk_widget_status *widget;
 
@@ -506,14 +491,39 @@ static void idle_work_cb(struct k_work *work) {
         }
 
         const int64_t inactive_ms = now - widget->last_key_press_at;
-        if (inactive_ms < BONGO_IDLE_TIMEOUT_MS) {
-            next_delay_ms = MIN(next_delay_ms, BONGO_IDLE_TIMEOUT_MS - inactive_ms);
+        if (inactive_ms < BONGO_SLEEP_TRANSITION_START_MS) {
+            next_run_at =
+                MIN(next_run_at, widget->last_key_press_at + BONGO_SLEEP_TRANSITION_START_MS);
             reschedule = true;
             continue;
         }
 
+        if (inactive_ms < BONGO_IDLE_TIMEOUT_MS) {
+            const uint8_t sleep_frame =
+                MIN((inactive_ms - BONGO_SLEEP_TRANSITION_START_MS) / BONGO_SLEEP_FRAME_PERIOD_MS,
+                    BONGO_SLEEP_FRAME_COUNT - 2);
+            const bool frame_changed =
+                !widget->falling_asleep || widget->sleep_frame != sleep_frame;
+
+            widget->falling_asleep = true;
+            widget->show_tap_frame = false;
+            widget->sleep_frame = sleep_frame;
+            if (frame_changed) {
+                draw_status(widget);
+            }
+
+            const int64_t next_frame_at = widget->last_key_press_at +
+                                          BONGO_SLEEP_TRANSITION_START_MS +
+                                          (sleep_frame + 1) * BONGO_SLEEP_FRAME_PERIOD_MS;
+            next_run_at = MIN(next_run_at, next_frame_at);
+            reschedule = true;
+            continue;
+        }
+
+        widget->falling_asleep = false;
         widget->sleeping = true;
         widget->show_tap_frame = false;
+        widget->sleep_frame = BONGO_SLEEP_FRAME_COUNT - 1;
         memset(widget->wpm_history, 0, sizeof(widget->wpm_history));
         widget->wpm_history_head = 0;
         widget->wpm_history_count = 0;
@@ -521,16 +531,18 @@ static void idle_work_cb(struct k_work *work) {
     }
 
     if (reschedule) {
+        const int64_t next_delay_ms = MAX(1, next_run_at - k_uptime_get());
         k_work_reschedule_for_queue(zmk_display_work_q(),
                                     CONTAINER_OF(work, struct k_work_delayable, work),
-                                    K_MSEC(MAX(1, next_delay_ms)));
+                                    K_MSEC(next_delay_ms));
     }
 }
 
 K_WORK_DELAYABLE_DEFINE(status_idle_work, idle_work_cb);
 
 static void restart_idle_timer(void) {
-    k_work_reschedule_for_queue(zmk_display_work_q(), &status_idle_work, BONGO_IDLE_TIMEOUT);
+    k_work_reschedule_for_queue(zmk_display_work_q(), &status_idle_work,
+                                BONGO_SLEEP_TRANSITION_START);
 }
 
 static void key_status_update_cb(struct key_status_state state) {
@@ -550,6 +562,7 @@ static void key_status_update_cb(struct key_status_state state) {
         widget->tap_until = now + BONGO_TAP_HOLD_MS;
         handled_press = true;
         woke_from_sleep = woke_from_sleep || widget->sleeping;
+        widget->falling_asleep = false;
         widget->sleeping = false;
         widget->show_tap_frame = true;
         if ((press_delta & 1U) != 0U) {
